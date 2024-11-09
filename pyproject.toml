@@ -8,7 +8,6 @@ dependencies = [
     "addict>=2.4.0",
     "click>=8.1.7",
     "einops>=0.8.0",
-    "flash-attn>=2.6.3",
     "gradio>=3.36.1",
     "omegaconf>=2.3.0",
     "pillow>=11.0.0",

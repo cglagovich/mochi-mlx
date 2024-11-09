@@ -5,7 +5,7 @@ import time
 
 import click
 import numpy as np
-import ray
+# import ray
 from einops import rearrange
 from PIL import Image
 from tqdm import tqdm
@@ -25,12 +25,13 @@ def set_model_path(path):
 def load_model():
     global model, model_path
     if model is None:
-        ray.init()
+        # ray.init()
         MOCHI_DIR = model_path
         VAE_CHECKPOINT_PATH = f"{MOCHI_DIR}/vae.safetensors"
         MODEL_CONFIG_PATH = f"{MOCHI_DIR}/dit-config.yaml"
         MODEL_CHECKPOINT_PATH = f"{MOCHI_DIR}/dit.safetensors"
         num_gpus = torch.cuda.device_count()
+        # num_gpus = 1
         if num_gpus < 4:
             print(f"WARNING: Mochi requires at least 4xH100 GPUs, but only {num_gpus} GPU(s) are available.")
         print(f"Launching with {num_gpus} GPUs.")

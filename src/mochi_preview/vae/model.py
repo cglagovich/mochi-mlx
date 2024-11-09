@@ -7,6 +7,7 @@ from einops import rearrange
 
 import mochi_preview.dit.joint_model.context_parallel as cp
 from mochi_preview.vae.cp_conv import cp_pass_frames, gather_all_frames
+from mochi_preview.utils import scaled_dot_product_attention
 
 
 def cast_tuple(t, length=1):
@@ -157,9 +158,9 @@ class ContextParallelConv3d(SafeConv3d):
 
         # Less efficient implementation for strided convs.
         # All gather x, infer and chunk.
-        assert (
-            x.dtype == torch.bfloat16
-        ), f"Expected x to be of type torch.bfloat16, got {x.dtype}"
+        # assert (
+        #     x.dtype == torch.bfloat16
+        # ), f"Expected x to be of type torch.bfloat16, got {x.dtype}"
 
         x = gather_all_frames(x)  # [B, C, k - 1 + global_T, H, W]
         return StridedSafeConv3d.forward(self, x, local_shard=True)
@@ -381,7 +382,7 @@ class Attention(nn.Module):
         )
 
         if q.size(0) <= chunk_size:
-            x = F.scaled_dot_product_attention(
+            x = scaled_dot_product_attention(
                 q, k, v, **attn_kwargs
             )  # [B, num_heads, t, head_dim]
         else:
@@ -392,7 +393,7 @@ class Attention(nn.Module):
                 qc = q[i : i + chunk_size]
                 kc = k[i : i + chunk_size]
                 vc = v[i : i + chunk_size]
-                chunk = F.scaled_dot_product_attention(qc, kc, vc, **attn_kwargs)
+                chunk = scaled_dot_product_attention(qc, kc, vc, **attn_kwargs)
                 x[i : i + chunk_size].copy_(chunk)
 
         assert x.size(0) == q.size(0)

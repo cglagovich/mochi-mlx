@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
-from flash_attn import flash_attn_varlen_qkvpacked_func
+# from flash_attn import flash_attn_varlen_qkvpacked_func
 from torch.nn.attention import sdpa_kernel
 
 import mochi_preview.dit.joint_model.context_parallel as cp
@@ -33,6 +33,59 @@ from mochi_preview.dit.joint_model.utils import (
 
 COMPILE_FINAL_LAYER = os.environ.get("COMPILE_DIT") == "1"
 COMPILE_MMDIT_BLOCK = os.environ.get("COMPILE_DIT") == "1"
+
+import torch
+import torch.nn.functional as F
+
+def flash_attn_varlen_qkvpacked_func(
+    qkv: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    max_seqlen: int,
+    dropout_p: float = 0.0,
+    softmax_scale: float = None,
+    causal: bool = False,
+):
+    # qkv shape: (total, 3, nheads, headdim)
+    total, _, num_heads, head_dim = qkv.size()
+    
+    # Split into Q, K, V
+    queries = qkv[:, 0]  # Shape: (total, nheads, headdim)
+    keys = qkv[:, 1]
+    values = qkv[:, 2]
+
+    # Optionally scale queries
+    if softmax_scale is None:
+        softmax_scale = 1.0 / (head_dim ** 0.5)
+
+    # Prepare output tensor
+    out = torch.zeros(total, num_heads, head_dim, device=qkv.device)
+
+    # Process each sequence in the batch
+    batch_size = cu_seqlens.size(0) - 1
+    for b in range(batch_size):
+        start = cu_seqlens[b]
+        end = cu_seqlens[b + 1]
+        
+        # Extract the current sequence's Q, K, V
+        q = queries[start:end]  # Shape: (seq_len, nheads, headdim)
+        k = keys[start:end]
+        v = values[start:end]
+
+        # Rearrange dimensions for scaled_dot_product_attention
+        q = q.unsqueeze(0)  # Add batch dim
+        k = k.unsqueeze(0)
+        v = v.unsqueeze(0)
+
+        # Use scaled_dot_product_attention
+        out[start:end] = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=None,
+            dropout_p=dropout_p,
+            is_causal=causal,
+            scale=softmax_scale
+        ).squeeze(0)  # Remove batch dim
+
+    return out
 
 
 class AsymmetricAttention(nn.Module):
@@ -117,7 +170,7 @@ class AsymmetricAttention(nn.Module):
 
         # Process visual features
         qkv_x = self.qkv_x(x)  # (B, M, 3 * dim_x)
-        assert qkv_x.dtype == torch.bfloat16
+        # assert qkv_x.dtype == torch.bfloat16
         qkv_x = cp.all_to_all_collect_tokens(
             qkv_x, self.num_heads
         )  # (3, B, N, local_h, head_dim)
@@ -167,7 +220,19 @@ class AsymmetricAttention(nn.Module):
         local_dim = local_heads * self.head_dim
         total = qkv.size(0)
 
-        with torch.autocast("cuda", enabled=False):
+        if qkv.is_cuda:
+            from flash_attn import flash_attn_varlen_qkvpacked_func
+
+            with torch.autocast("cuda", enabled=False):
+                out: torch.Tensor = flash_attn_varlen_qkvpacked_func(
+                    qkv,
+                    cu_seqlens=cu_seqlens,
+                    max_seqlen=max_seqlen_in_batch,
+                    dropout_p=0.0,
+                    softmax_scale=self.softmax_scale,
+                )  # (total, local_heads, head_dim)
+
+        else:
             out: torch.Tensor = flash_attn_varlen_qkvpacked_func(
                 qkv,
                 cu_seqlens=cu_seqlens,
@@ -175,7 +240,8 @@ class AsymmetricAttention(nn.Module):
                 dropout_p=0.0,
                 softmax_scale=self.softmax_scale,
             )  # (total, local_heads, head_dim)
-            out = out.view(total, local_dim)
+
+        out = out.view(total, local_dim)
 
         x, y = pad_and_split_xy(out, valid_token_indices, B, N, L, qkv.dtype)
         assert x.size() == (B, N, local_dim)
@@ -230,6 +296,8 @@ class AsymmetricAttention(nn.Module):
             valid_token_indices=packed_indices["valid_token_indices_kv"],
         )  # (total <= B * (N + L), 3, local_heads, head_dim)
 
+        # Seqlen is huge here because B=2 (positive and negative cond) are flattened into one long sequence.
+        # In my test case, positive cond has seqlen 118 and negative has seqlen 0, which explains the cu_seqlens tensor.
         x, y = self.run_attention(
             qkv,
             B=B,
@@ -577,6 +645,9 @@ class AsymmDiTJoint(nn.Module):
             packed_indices: Dict with keys for Flash Attention. Result of compute_packed_indices.
         """
         B, _, T, H, W = x.shape
+        print(f'dit input {x.shape=}')
+        print(f'dit input {y_feat[0].shape=}')
+        print(f'dit input {y_mask[0].shape=}')
 
         # Use EFFICIENT_ATTENTION backend for T5 pooling, since we have a mask.
         # Have to call sdpa_kernel outside of a torch.compile region.

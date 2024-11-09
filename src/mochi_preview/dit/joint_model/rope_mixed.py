@@ -80,9 +80,12 @@ def compute_mixed_rotation(
         freqs_cos: [N, num_heads, num_freqs] - cosine components
         freqs_sin: [N, num_heads, num_freqs] - sine components
     """
-    with torch.autocast("cuda", enabled=False):
-        assert freqs.ndim == 3
+    assert freqs.ndim == 3
+    
+    # Use autocast to handle dtype correctly for both CUDA and CPU
+    with torch.autocast(device_type='cuda' if freqs.is_cuda else 'cpu', enabled=False):
         freqs_sum = torch.einsum("Nd,dhf->Nhf", pos.to(freqs), freqs)
         freqs_cos = torch.cos(freqs_sum)
         freqs_sin = torch.sin(freqs_sum)
+    
     return freqs_cos, freqs_sin

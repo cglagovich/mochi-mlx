@@ -7,7 +7,7 @@ from typing import Dict, List
 from safetensors.torch import load_file
 import numpy as np
 import torch
-import torch.distributed as dist
+# import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.data
@@ -15,18 +15,18 @@ import yaml
 from einops import rearrange, repeat
 from omegaconf import OmegaConf
 from torch import nn
-from torch.distributed.fsdp import (
-    BackwardPrefetch,
-    MixedPrecision,
-    ShardingStrategy,
-)
-from torch.distributed.fsdp import (
-    FullyShardedDataParallel as FSDP,
-)
-from torch.distributed.fsdp.wrap import (
-    lambda_auto_wrap_policy,
-    transformer_auto_wrap_policy,
-)
+# from torch.distributed.fsdp import (
+#     BackwardPrefetch,
+#     MixedPrecision,
+#     ShardingStrategy,
+# )
+# from torch.distributed.fsdp import (
+#     FullyShardedDataParallel as FSDP,
+# )
+# from torch.distributed.fsdp.wrap import (
+#     lambda_auto_wrap_policy,
+#     transformer_auto_wrap_policy,
+# )
 from transformers import T5EncoderModel, T5Tokenizer
 from transformers.models.t5.modeling_t5 import T5Block
 
@@ -94,23 +94,26 @@ def unnormalize_latents(
     return z * std.to(z) + mean.to(z)
 
 
-def setup_fsdp_sync(model, device_id, *, param_dtype, auto_wrap_policy) -> FSDP:
-    model = FSDP(
-        model,
-        sharding_strategy=ShardingStrategy.FULL_SHARD,
-        mixed_precision=MixedPrecision(
-            param_dtype=param_dtype,
-            reduce_dtype=torch.float32,
-            buffer_dtype=torch.float32,
-        ),
-        auto_wrap_policy=auto_wrap_policy,
-        backward_prefetch=BackwardPrefetch.BACKWARD_PRE,
-        limit_all_gathers=True,
-        device_id=device_id,
-        sync_module_states=True,
-        use_orig_params=True,
-    )
-    torch.cuda.synchronize()
+# def setup_fsdp_sync(model, device_id, *, param_dtype, auto_wrap_policy) -> FSDP:
+#     model = FSDP(
+#         model,
+#         sharding_strategy=ShardingStrategy.FULL_SHARD,
+#         mixed_precision=MixedPrecision(
+#             param_dtype=param_dtype,
+#             reduce_dtype=torch.float32,
+#             buffer_dtype=torch.float32,
+#         ),
+#         auto_wrap_policy=auto_wrap_policy,
+#         backward_prefetch=BackwardPrefetch.BACKWARD_PRE,
+#         limit_all_gathers=True,
+#         device_id=device_id,
+#         sync_module_states=True,
+#         use_orig_params=True,
+#     )
+#     # torch.cuda.synchronize()
+#     return model
+
+def setup_fsdp_sync(model, *args, **kwargs):
     return model
 
 
@@ -191,39 +194,44 @@ class T2VSynthMochiModel:
         super().__init__()
         t = Timer()
         self.device = torch.device(device_id)
+        if not self.device.type == "cuda":
+            self.device = torch.device("cpu")
         if world_size > 1:
-            os.environ["MASTER_ADDR"] = "127.0.0.1"
-            os.environ["MASTER_PORT"] = "29500"
-            with t("init_process_group (can take 20-30 seconds)"):
-                dist.init_process_group(
-                    "nccl",
-                    rank=local_rank,
-                    world_size=world_size,
-                    device_id=self.device,  # force non-lazy init
-                )
-                # get the default PG
-                pg = dist.group.WORLD
-                cp.set_cp_group(pg, list(range(world_size)), local_rank)
+            assert False
+            # os.environ["MASTER_ADDR"] = "127.0.0.1"
+            # os.environ["MASTER_PORT"] = "29500"
+            # with t("init_process_group (can take 20-30 seconds)"):
+            #     dist.init_process_group(
+            #         "nccl",
+            #         rank=local_rank,
+            #         world_size=world_size,
+            #         device_id=self.device,  # force non-lazy init
+            #     )
+            #     # get the default PG
+            #     pg = dist.group.WORLD
+            #     cp.set_cp_group(pg, list(range(world_size)), local_rank)
 
         self.t5_tokenizer = T5_Tokenizer()
 
         with t("load_text_encs"):
             t5_enc = T5EncoderModel.from_pretrained(T5_MODEL).eval().to(self.device)
-            self.t5_enc = (
-                setup_fsdp_sync(
-                    t5_enc,
-                    device_id=device_id,
-                    param_dtype=torch.float32,
-                    auto_wrap_policy=partial(
-                        transformer_auto_wrap_policy,
-                        transformer_layer_cls={
-                            T5Block,
-                        },
-                    ),
-                )
-                if world_size > 1
-                else t5_enc.to(self.device)
-            )
+            # self.t5_enc = (
+            #     setup_fsdp_sync(
+            #         t5_enc,
+            #         device_id=device_id,
+            #         param_dtype=torch.float32,
+            #         auto_wrap_policy=partial(
+            #             transformer_auto_wrap_policy,
+            #             transformer_layer_cls={
+            #                 T5Block,
+            #             },
+            #         ),
+            #     )
+            #     if world_size > 1
+            #     else t5_enc.to(self.device)
+            # )
+            self.t5_enc = t5_enc
+            self.t5_enc.to(self.device)
             self.t5_enc.eval()
 
         with t("load_vae"):
@@ -243,7 +251,8 @@ class T2VSynthMochiModel:
                 causal=True,
             )
             decoder_sd = load_file(vae_checkpoint_path)
-            self.decoder.load_state_dict(decoder_sd, strict=True)
+            if not os.environ.get("NO_LOAD", False):
+                self.decoder.load_state_dict(decoder_sd, strict=True)
             self.decoder.eval().to(self.device)
 
         with t("construct_dit"):
@@ -274,22 +283,25 @@ class T2VSynthMochiModel:
         with t("dit_load_checkpoint"):
             # FSDP syncs weights
             if local_rank == 0:
-                model.load_state_dict(load_file(dit_checkpoint_path))
+                if not os.environ.get("NO_LOAD", False):
+                    model.load_state_dict(load_file(dit_checkpoint_path))
 
         with t("fsdp_dit"):
-            self.dit = (
-                setup_fsdp_sync(
-                    model,
-                    device_id=device_id,
-                    param_dtype=torch.bfloat16,
-                    auto_wrap_policy=partial(
-                        lambda_auto_wrap_policy,
-                        lambda_fn=lambda m: m in model.blocks,
-                    ),
-                )
-                if world_size > 1
-                else model.to(self.device)
-            )
+            # self.dit = (
+            #     setup_fsdp_sync(
+            #         model,
+            #         device_id=device_id,
+            #         param_dtype=torch.bfloat16,
+            #         auto_wrap_policy=partial(
+            #             lambda_auto_wrap_policy,
+            #             lambda_fn=lambda m: m in model.blocks,
+            #         ),
+            #     )
+            #     if world_size > 1
+            #     else model.to(self.device)
+            # )
+            self.dit = model
+            self.dit.to(self.device)
             self.dit.eval()
             if os.environ.get("COMPILE_DIT") == "1":
                 print("COMPILING DIT ...")
@@ -431,12 +443,12 @@ class T2VSynthMochiModel:
 
         def model_fn(*, z, sigma, cfg_scale):
             if batch_cfg:
-                with torch.autocast("cuda", dtype=torch.bfloat16):
+                with torch.autocast(device_type='cuda' if z.is_cuda else 'cpu', dtype=torch.bfloat16 if z.is_cuda else torch.float32):
                     out = self.dit(z, sigma, **sample_batched)
                 out_cond, out_uncond = torch.chunk(out, chunks=2, dim=0)
             else:
                 nonlocal sample, sample_null
-                with torch.autocast("cuda", dtype=torch.bfloat16):
+                with torch.autocast(device_type='cuda' if z.is_cuda else 'cpu', dtype=torch.bfloat16 if z.is_cuda else torch.float32):
                     out_cond = self.dit(z, sigma, **sample)
                     out_uncond = self.dit(z, sigma, **sample_null)
             assert out_cond.shape == out_uncond.shape
@@ -475,7 +487,7 @@ class T2VSynthMochiModel:
             z = z[:B]
         z = z.tensor_split(cp_size, dim=2)[cp_rank]  # split along temporal dim
         samples = unnormalize_latents(z.float(), self.vae_mean, self.vae_std)
-        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+        with torch.amp.autocast(device_type='cuda' if samples.is_cuda else 'cpu', dtype=torch.bfloat16 if samples.is_cuda else torch.float32):
             samples = self.decoder(samples)
 
         samples = cp_conv.gather_all_frames(samples)

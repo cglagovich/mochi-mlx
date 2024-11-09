@@ -3,6 +3,7 @@ from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from mochi_preview.utils import scaled_dot_product_attention
 
 
 def modulate(x, shift, scale):
@@ -87,7 +88,7 @@ class AttentionPool(nn.Module):
         q = q.unsqueeze(2)  # (B, H, 1, head_dim)
 
         # Compute attention.
-        x = F.scaled_dot_product_attention(
+        x = scaled_dot_product_attention(
             q, k, v, attn_mask=attn_mask, dropout_p=0.0
         )  # (B, H, 1, head_dim)
 

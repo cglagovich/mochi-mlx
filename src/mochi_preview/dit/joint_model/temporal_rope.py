@@ -19,7 +19,7 @@ def apply_rotary_emb_qk_real(
     Returns:
         torch.Tensor: The input tensor with rotary embeddings applied.
     """
-    assert xqk.dtype == torch.bfloat16
+    # assert xqk.dtype == torch.bfloat16
     # Split the last dimension into even and odd parts
     xqk_even = xqk[..., 0::2]
     xqk_odd = xqk[..., 1::2]
@@ -30,5 +30,5 @@ def apply_rotary_emb_qk_real(
 
     # Interleave the results back into the original shape
     out = torch.stack([cos_part, sin_part], dim=-1).flatten(-2)
-    assert out.dtype == torch.bfloat16
+    # assert out.dtype == torch.bfloat16
     return out
