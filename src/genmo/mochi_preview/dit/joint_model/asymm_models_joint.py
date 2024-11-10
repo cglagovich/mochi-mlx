@@ -583,40 +583,41 @@ class AsymmDiTJoint(nn.Module):
         """
         B, _, T, H, W = x.shape
 
-        from torch.profiler import profile, record_function, ProfilerActivity
-        with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=True) as prof:
-            with record_function("full_dit"):
-                # Use EFFICIENT_ATTENTION backend for T5 pooling, since we have a mask.
-                # Have to call sdpa_kernel outside of a torch.compile region.
-                with sdpa_kernel(torch.nn.attention.SDPBackend.EFFICIENT_ATTENTION):
+        with torch.profiler.record_function("full_dit"):
+            # Use EFFICIENT_ATTENTION backend for T5 pooling, since we have a mask.
+            # Have to call sdpa_kernel outside of a torch.compile region.
+            with sdpa_kernel(torch.nn.attention.SDPBackend.EFFICIENT_ATTENTION):
+                with torch.profiler.record_function("prepare"):
                     x, c, y_feat, rope_cos, rope_sin = self.prepare(x, sigma, y_feat[0], y_mask[0])
-                del y_mask
+            del y_mask
 
-                cp_rank, cp_size = cp.get_cp_rank_size()
-                N = x.size(1)
-                M = N // cp_size
-                assert N % cp_size == 0, f"Visual sequence length ({x.shape[1]}) must be divisible by cp_size ({cp_size})."
+            cp_rank, cp_size = cp.get_cp_rank_size()
+            N = x.size(1)
+            M = N // cp_size
+            assert N % cp_size == 0, f"Visual sequence length ({x.shape[1]}) must be divisible by cp_size ({cp_size})."
 
-                if cp_size > 1:
-                    x = x.narrow(1, cp_rank * M, M)
+            if cp_size > 1:
+                x = x.narrow(1, cp_rank * M, M)
 
-                    assert self.num_heads % cp_size == 0
-                    local_heads = self.num_heads // cp_size
-                    rope_cos = rope_cos.narrow(1, cp_rank * local_heads, local_heads)
-                    rope_sin = rope_sin.narrow(1, cp_rank * local_heads, local_heads)
-                for i, block in enumerate(self.blocks):
-                            x, y_feat = block(
-                                x,
-                                c,
-                                y_feat,
-                                rope_cos=rope_cos,
-                                rope_sin=rope_sin,
-                                packed_indices=packed_indices,
-                            )  # (B, M, D), (B, L, D)
-                    
+                assert self.num_heads % cp_size == 0
+                local_heads = self.num_heads // cp_size
+                rope_cos = rope_cos.narrow(1, cp_rank * local_heads, local_heads)
+                rope_sin = rope_sin.narrow(1, cp_rank * local_heads, local_heads)
+            for i, block in enumerate(self.blocks):
+                with torch.profiler.record_function(f"block"):
+                    x, y_feat = block(
+                        x,
+                        c,
+                        y_feat,
+                        rope_cos=rope_cos,
+                        rope_sin=rope_sin,
+                        packed_indices=packed_indices,
+                    )  # (B, M, D), (B, L, D)
+                
 
-                del y_feat  # Final layers don't use dense text features.
+            del y_feat  # Final layers don't use dense text features.
 
+            with torch.profiler.record_function("final_layer"):
                 x = self.final_layer(x, c)  # (B, M, patch_size ** 2 * out_channels)
 
                 patch = x.size(2)
@@ -633,23 +634,4 @@ class AsymmDiTJoint(nn.Module):
                     c=self.out_channels,
                 )
 
-        # Save detailed profiling information to file
-        profile_path = f"profile_out/compiled/full_dit.txt"
-        with open(profile_path, 'w') as f:
-            # Overall stats sorted by CPU time
-            f.write("=== CPU Time Stats ===\n")
-            f.write(prof.key_averages().table(sort_by="cpu_time_total", row_limit=None))
-            f.write("\n\n=== CUDA Time Stats ===\n")
-            f.write(prof.key_averages().table(sort_by="cuda_time_total", row_limit=None))
-            f.write("\n\n=== Memory Stats ===\n")
-            f.write(prof.key_averages().table(sort_by="cpu_memory_usage", row_limit=None))
-            
-            # Detailed event trace
-            f.write("\n\n=== Detailed Event Trace ===\n")
-            f.write(prof.key_averages(group_by_input_shape=True).table(row_limit=None))
-            
-            # Export chrome trace if needed
-            prof.export_chrome_trace(f"profile_out/compiled/chrome_trace_full_dit.json")
-
-        exit(0)
         return x

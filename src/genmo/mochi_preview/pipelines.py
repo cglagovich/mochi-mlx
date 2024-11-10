@@ -6,6 +6,7 @@ from contextlib import contextmanager
 from functools import partial
 from typing import Any, Dict, List, Literal, Optional, Union, cast
 
+import time
 import numpy as np
 import ray
 import torch
@@ -339,33 +340,53 @@ def sample_model(device, dit, conditioning, **args):
         z = repeat(z, "b ... -> (repeat b) ...", repeat=2)
 
     def model_fn(*, z, sigma, cfg_scale):
-        if cond_batched:
-            with torch.autocast("cuda", dtype=torch.bfloat16):
-                out = dit(z, sigma, **cond_batched)
-            out_cond, out_uncond = torch.chunk(out, chunks=2, dim=0)
-        else:
-            nonlocal cond_text, cond_null
-            with torch.autocast("cuda", dtype=torch.bfloat16):
-                out_cond = dit(z, sigma, **cond_text)
-                out_uncond = dit(z, sigma, **cond_null)
-        assert out_cond.shape == out_uncond.shape
-        out_uncond = out_uncond.to(z)
-        out_cond = out_cond.to(z)
-        return out_uncond + cfg_scale * (out_cond - out_uncond)
+        with torch.profiler.record_function("model_fn"):
+            if cond_batched:
+                with torch.autocast("cuda", dtype=torch.bfloat16):
+                    out = dit(z, sigma, **cond_batched)
+                out_cond, out_uncond = torch.chunk(out, chunks=2, dim=0)
+            else:
+                nonlocal cond_text, cond_null
+                with torch.autocast("cuda", dtype=torch.bfloat16):
+                    out_cond = dit(z, sigma, **cond_text)
+                    out_uncond = dit(z, sigma, **cond_null)
+            assert out_cond.shape == out_uncond.shape
+            out_uncond = out_uncond.to(z)
+            out_cond = out_cond.to(z)
+            return out_uncond + cfg_scale * (out_cond - out_uncond)
 
     # Euler sampler w/ customizable sigma schedule & cfg scale
     for i in get_new_progress_bar(range(0, sample_steps), desc="Sampling"):
         sigma = sigma_schedule[i]
         dsigma = sigma - sigma_schedule[i + 1]
-
-        # `pred` estimates `z_0 - eps`.
-        pred = model_fn(
-            z=z,
-            sigma=torch.full([B] if cond_text else [B * 2], sigma, device=z.device),
-            cfg_scale=cfg_schedule[i],
-        )
-        assert pred.dtype == torch.float32
-        z = z + dsigma * pred
+        if os.environ.get("PROFILE_DIT") == "1":
+            with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA], record_shapes=True) as prof:
+                # `pred` estimates `z_0 - eps`.
+                start = time.perf_counter()
+                pred = model_fn(
+                    z=z,
+                    sigma=torch.full([B] if cond_text else [B * 2], sigma, device=z.device),
+                    cfg_scale=cfg_schedule[i],
+                )
+                assert pred.dtype == torch.float32
+                z = z + dsigma * pred
+                torch.cuda.synchronize()  # Wait for all CUDA ops to finish
+                duration = time.perf_counter() - start
+                print(f"Step {i+1}/{sample_steps}: model_fn took {duration:.3f} seconds")
+            prof.export_chrome_trace(f"profile_out/compiled/chrome_trace_full_dit.json")
+        else:
+            # `pred` estimates `z_0 - eps`.
+            start = time.perf_counter()
+            pred = model_fn(
+                z=z,
+                sigma=torch.full([B] if cond_text else [B * 2], sigma, device=z.device),
+                cfg_scale=cfg_schedule[i],
+            )
+            assert pred.dtype == torch.float32
+            z = z + dsigma * pred
+            torch.cuda.synchronize()  # Wait for all CUDA ops to finish
+            duration = time.perf_counter() - start
+            print(f"Step {i+1}/{sample_steps}: model_fn took {duration:.3f} seconds")
 
     z = z[:B] if cond_batched else z
     return dit_latents_to_vae_latents(z)
