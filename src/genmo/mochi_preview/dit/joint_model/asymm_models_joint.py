@@ -7,6 +7,8 @@ import torch.nn.functional as F
 from einops import rearrange
 from torch.nn.attention import sdpa_kernel
 
+from genmo.lib.utils import Timer
+
 import genmo.mochi_preview.dit.joint_model.context_parallel as cp
 from genmo.mochi_preview.dit.joint_model.layers import (
     FeedForward,
@@ -598,16 +600,42 @@ class AsymmDiTJoint(nn.Module):
             local_heads = self.num_heads // cp_size
             rope_cos = rope_cos.narrow(1, cp_rank * local_heads, local_heads)
             rope_sin = rope_sin.narrow(1, cp_rank * local_heads, local_heads)
+        from torch.profiler import profile, record_function, ProfilerActivity
 
-        for i, block in enumerate(self.blocks):
-            x, y_feat = block(
-                x,
-                c,
-                y_feat,
-                rope_cos=rope_cos,
-                rope_sin=rope_sin,
-                packed_indices=packed_indices,
-            )  # (B, M, D), (B, L, D)
+        timer = Timer()
+        with timer("DIT Blocks"):
+            for i, block in enumerate(self.blocks):
+                with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=True) as prof:
+                    with record_function("dit_block"):
+                        x, y_feat = block(
+                            x,
+                            c,
+                            y_feat,
+                            rope_cos=rope_cos,
+                            rope_sin=rope_sin,
+                            packed_indices=packed_indices,
+                        )  # (B, M, D), (B, L, D)
+                
+                # Save detailed profiling information to file
+                profile_path = f"profiling_block_{i}.txt"
+                with open(profile_path, 'w') as f:
+                    # Overall stats sorted by CPU time
+                    f.write("=== CPU Time Stats ===\n")
+                    f.write(prof.key_averages().table(sort_by="cpu_time_total", row_limit=None))
+                    f.write("\n\n=== CUDA Time Stats ===\n")
+                    f.write(prof.key_averages().table(sort_by="cuda_time_total", row_limit=None))
+                    f.write("\n\n=== Memory Stats ===\n")
+                    f.write(prof.key_averages().table(sort_by="cpu_memory_usage", row_limit=None))
+                    
+                    # Detailed event trace
+                    f.write("\n\n=== Detailed Event Trace ===\n")
+                    f.write(prof.key_averages(group_by_input_shape=True).table(row_limit=None))
+                    
+                    # Export chrome trace if needed
+                    prof.export_chrome_trace(f"chrome_trace_block_{i}.json")
+
+        exit(0)
+        timer.print_stats()
         del y_feat  # Final layers don't use dense text features.
 
         x = self.final_layer(x, c)  # (B, M, patch_size ** 2 * out_channels)
