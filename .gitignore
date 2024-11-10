@@ -1,4 +1,6 @@
 .venv
+profile_out
+venv
 .venv_test
 dist
 __pycache__
